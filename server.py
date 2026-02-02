@@ -27,20 +27,32 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Initialize RAG service
+# Initialize RAG service (lazy loading)
 rag = None
+rag_init_error = None
+rag_initialized = False
+
+
+def get_rag_service():
+    """Lazy initialization of RAG service"""
+    global rag, rag_init_error, rag_initialized
+    if not rag_initialized:
+        try:
+            if not rag:
+                rag = MultiTenantRAG()
+            rag_initialized = True
+            print("✅ RAG service initialized (lazy)")
+        except Exception as e:
+            rag_init_error = str(e)
+            print(f"❌ Error initializing RAG: {e}")
+            raise
+    return rag
 
 
 @app.on_event("startup")
 async def startup():
-    """Initialize RAG service on startup"""
-    global rag
-    try:
-        rag = MultiTenantRAG()
-        print("✅ RAG service initialized")
-    except Exception as e:
-        print(f"❌ Error initializing RAG: {e}")
-        raise
+    """Startup handler - server is ready immediately"""
+    print("✅ Server started - RAG will initialize on first request")
 
 
 # ============ Pydantic Models ============
@@ -78,13 +90,17 @@ async def root():
 
 @app.get("/health")
 async def health():
-    """Health check"""
+    """Health check - responds immediately"""
     status = {
         "service": "healthy",
-        "rag_initialized": rag is not None
+        "rag_initialized": rag_initialized,
+        "server": "ready"
     }
 
-    if rag:
+    if rag_init_error:
+        status["rag_error"] = rag_init_error
+
+    if rag_initialized and rag:
         try:
             indexes = rag.pc.list_indexes()
             status["pinecone_connected"] = True
@@ -94,6 +110,18 @@ async def health():
             status["error"] = str(e)
 
     return status
+
+
+@app.get("/status")
+async def status():
+    """Detailed service status"""
+    return {
+        "service": "ParcelAm RAG API",
+        "version": "1.0.0",
+        "rag_initialized": rag_initialized,
+        "rag_error": rag_init_error,
+        "message": "RAG service initializes on first request" if not rag_initialized else "RAG service ready"
+    }
 
 
 @app.post("/query")
@@ -106,11 +134,9 @@ async def query_rag(request: QueryRequest):
         question: User's question
         filter: Optional metadata filter
     """
-    if not rag:
-        raise HTTPException(status_code=503, detail="RAG service not initialized")
-
     try:
-        result = rag.query(
+        rag_service = get_rag_service()
+        result = rag_service.query(
             tenant_id=request.tenant_id,
             question=request.question,
             filter=request.filter
@@ -134,12 +160,10 @@ async def index_documents(request: IndexRequest):
         tenant_id: User/organization ID
         documents: List of documents to index
     """
-    if not rag:
-        raise HTTPException(status_code=503, detail="RAG service not initialized")
-
     try:
+        rag_service = get_rag_service()
         docs = [doc.model_dump() for doc in request.documents]
-        count = rag.index_bulk_documents(
+        count = rag_service.index_bulk_documents(
             tenant_id=request.tenant_id,
             documents=docs
         )
@@ -161,11 +185,9 @@ async def index_sample_data(tenant_id: str):
     Args:
         tenant_id: Tenant ID to index documents for
     """
-    if not rag:
-        raise HTTPException(status_code=503, detail="RAG service not initialized")
-
     try:
-        count = rag.index_bulk_documents(
+        rag_service = get_rag_service()
+        count = rag_service.index_bulk_documents(
             tenant_id=tenant_id,
             documents=SAMPLE_PARCEL_DOCUMENTS
         )
@@ -183,11 +205,9 @@ async def index_sample_data(tenant_id: str):
 @app.delete("/tenant/{tenant_id}")
 async def delete_tenant(tenant_id: str):
     """Delete all data for a tenant"""
-    if not rag:
-        raise HTTPException(status_code=503, detail="RAG service not initialized")
-
     try:
-        success = rag.delete_tenant_data(tenant_id)
+        rag_service = get_rag_service()
+        success = rag_service.delete_tenant_data(tenant_id)
         return {
             "success": success,
             "tenant_id": tenant_id
