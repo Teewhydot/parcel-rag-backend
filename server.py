@@ -90,7 +90,13 @@ async def root():
 
 @app.get("/health")
 async def health():
-    """Health check - responds immediately"""
+    """Health check - initializes RAG to keep service warm"""
+    try:
+        # Trigger RAG initialization to keep service warm
+        get_rag_service()
+    except Exception as e:
+        pass  # Don't fail health check if RAG init fails
+
     status = {
         "service": "healthy",
         "rag_initialized": rag_initialized,
