@@ -1,21 +1,24 @@
 """
-FastAPI Server for ParcelAm RAG Service
-Deploy to: Render.com
+FastAPI Server for ParcelAm using Pinecone Assistant
+Replaces the previous custom RAG implementation
 """
 
+import os
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import List, Dict, Optional
-import os
+import requests
+from pinecone import Pinecone
+from dotenv import load_dotenv
 
-from rag_service import MultiTenantRAG, SAMPLE_PARCEL_DOCUMENTS
+# Load environment variables
+load_dotenv()
 
-# Initialize FastAPI
 app = FastAPI(
-    title="ParcelAm RAG API",
-    description="Pinecone-powered semantic search for ParcelAm",
-    version="1.0.0"
+    title="ParcelAm Assistant API",
+    description="Pinecone Assistant API for ParcelAm customer support",
+    version="2.0.0"
 )
 
 # Enable CORS
@@ -27,199 +30,192 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Initialize RAG service (lazy loading)
-rag = None
-rag_init_error = None
-rag_initialized = False
+# Initialize Pinecone
+pc = Pinecone(api_key=os.getenv("PINECONE_API_KEY"))
+
+# Configure Assistant
+ASSISTANT_NAME = "parcel-assistant"
+ASSISTANT_HOST = "https://prod-1-data.ke.pinecone.io/assistant"  # Fixed host
 
 
-def get_rag_service():
-    """Lazy initialization of RAG service"""
-    global rag, rag_init_error, rag_initialized
-    if not rag_initialized:
-        try:
-            if not rag:
-                rag = MultiTenantRAG()
-            rag_initialized = True
-            print("✅ RAG service initialized (lazy)")
-        except Exception as e:
-            rag_init_error = str(e)
-            print(f"❌ Error initializing RAG: {e}")
-            raise
-    return rag
-
-
-@app.on_event("startup")
-async def startup():
-    """Startup handler - server is ready immediately"""
-    print("✅ Server started - RAG will initialize on first request")
-
-
-# ============ Pydantic Models ============
-
+# Pydantic Models
 class QueryRequest(BaseModel):
-    tenant_id: str
+    tenant_id: str = "default"  # Tenant ID for future multi-tenancy
     question: str
-    filter: Optional[Dict] = None
 
 
-class Document(BaseModel):
-    _id: str
-    content: str
-    title: Optional[str] = None
-    category: Optional[str] = None
-    metadata: Optional[Dict] = None
-
-
-class IndexRequest(BaseModel):
+class AssistantResponse(BaseModel):
+    answer: str
+    citations: List[Dict]
     tenant_id: str
-    documents: List[Document]
 
 
-# ============ API Endpoints ============
+# API Endpoints
 
 @app.get("/")
 async def root():
     """Root endpoint"""
     return {
-        "service": "ParcelAm RAG API",
-        "status": "running",
-        "version": "1.0.0"
+        "service": "ParcelAm Assistant API",
+        "version": "2.0.0",
+        "assistant": ASSISTANT_NAME,
+        "status": "running"
     }
 
 
 @app.get("/health")
 async def health():
-    """Health check - initializes RAG to keep service warm"""
+    """Health check"""
     try:
-        # Trigger RAG initialization to keep service warm
-        get_rag_service()
+        # Test connection to Pinecone
+        pc.list_indexes()
+        return {
+            "service": "healthy",
+            "pinecone_connected": True,
+            "assistant": ASSISTANT_NAME,
+            "status": "ready"
+        }
     except Exception as e:
-        pass  # Don't fail health check if RAG init fails
-
-    status = {
-        "service": "healthy",
-        "rag_initialized": rag_initialized,
-        "server": "ready"
-    }
-
-    if rag_init_error:
-        status["rag_error"] = rag_init_error
-
-    if rag_initialized and rag:
-        try:
-            indexes = rag.pc.list_indexes()
-            status["pinecone_connected"] = True
-            status["index_count"] = len(indexes.indexes)
-        except Exception as e:
-            status["pinecone_connected"] = False
-            status["error"] = str(e)
-
-    return status
-
-
-@app.get("/status")
-async def status():
-    """Detailed service status"""
-    return {
-        "service": "ParcelAm RAG API",
-        "version": "1.0.0",
-        "rag_initialized": rag_initialized,
-        "rag_error": rag_init_error,
-        "message": "RAG service initializes on first request" if not rag_initialized else "RAG service ready"
-    }
+        return {
+            "service": "healthy",
+            "pinecone_connected": False,
+            "error": str(e),
+            "status": "partial"
+        }
 
 
 @app.post("/query")
-async def query_rag(request: QueryRequest):
+async def query_assistant(request: QueryRequest):
     """
-    Query the RAG system
+    Query the Pinecone Assistant
 
     Args:
-        tenant_id: User/organization ID
+        tenant_id: User/organization ID (currently unused, kept for future multi-tenancy)
         question: User's question
-        filter: Optional metadata filter
     """
     try:
-        rag_service = get_rag_service()
-        result = rag_service.query(
-            tenant_id=request.tenant_id,
-            question=request.question,
-            filter=request.filter
+        # Get assistant instance
+        from pinecone_plugins.assistant.models.chat import Message
+
+        # Initialize assistant
+        assistant = pc.assistant.Assistant(assistant_name=ASSISTANT_NAME)
+
+        # Create message
+        message = Message(role="user", content=request.question)
+
+        # Get response from assistant
+        response = assistant.chat(messages=[message])
+
+        # Format citations
+        citations = []
+        if hasattr(response, 'citations') and response.citations:
+            for citation in response.citations:
+                references = citation.get('references', [])
+                for ref in references:
+                    citations.append({
+                        "file_name": ref.get("file.name", "Unknown"),
+                        "file_id": ref.get("file.id", ""),
+                        "pages": ref.get("pages", []),
+                        "position": citation.get("position", 0),
+                        "metadata": ref.get("metadata", {})
+                    })
+
+        return AssistantResponse(
+            answer=response.message.content,
+            citations=citations,
+            tenant_id=request.tenant_id
         )
 
-        return {
-            "answer": result.answer,
-            "sources": result.sources,
-            "tenant_id": result.tenant_id
-        }
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=f"Assistant error: {str(e)}")
 
 
-@app.post("/index")
-async def index_documents(request: IndexRequest):
-    """
-    Index documents for a tenant
-
-    Args:
-        tenant_id: User/organization ID
-        documents: List of documents to index
-    """
+@app.get("/assistant/status")
+async def assistant_status():
+    """Get assistant status and configuration"""
     try:
-        rag_service = get_rag_service()
-        docs = [doc.model_dump() for doc in request.documents]
-        count = rag_service.index_bulk_documents(
-            tenant_id=request.tenant_id,
-            documents=docs
-        )
+        # List assistants to verify ours exists
+        assistants = pc.assistant.list_assistants()
+
+        # Find our assistant
+        our_assistant = None
+        for asst in assistants:
+            if asst.name == ASSISTANT_NAME:
+                our_assistant = asst
+                break
+
+        if not our_assistant:
+            return {
+                "status": "not_found",
+                "assistant": ASSISTANT_NAME,
+                "message": "Assistant not found in your Pinecone account"
+            }
 
         return {
-            "success": True,
-            "indexed": count,
+            "status": "ready",
+            "assistant": ASSISTANT_NAME,
+            "host": ASSISTANT_HOST,
+            "region": our_assistant.region,
+            "assistant_host": our_assistant.host,
+            "message": "Assistant is ready for queries"
+        }
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Status check failed: {str(e)}")
+
+
+@app.get("/assistant/context")
+async def get_context(request: QueryRequest):
+    """
+    Get relevant context snippets without generating a full response
+    Useful for debugging or custom RAG implementations
+    """
+    try:
+        assistant = pc.assistant.Assistant(assistant_name=ASSISTANT_NAME)
+
+        response = assistant.context(
+            query=request.question,
+            top_k=5,
+            snippet_size=1024
+        )
+
+        # Format context snippets
+        snippets = []
+        for snippet in response.snippets:
+            snippets.append({
+                "content": snippet.content,
+                "score": snippet.score,
+                "file_name": snippet.reference.file.name,
+                "file_id": snippet.reference.file.id,
+                "pages": snippet.reference.pages
+            })
+
+        return {
+            "query": request.question,
+            "snippets": snippets,
             "tenant_id": request.tenant_id
         }
+
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=f"Context retrieval failed: {str(e)}")
 
 
-@app.post("/index-sample")
-async def index_sample_data(tenant_id: str):
-    """
-    Index sample parcel documents (for testing)
-
-    Args:
-        tenant_id: Tenant ID to index documents for
-    """
-    try:
-        rag_service = get_rag_service()
-        count = rag_service.index_bulk_documents(
-            tenant_id=tenant_id,
-            documents=SAMPLE_PARCEL_DOCUMENTS
-        )
-
-        return {
-            "success": True,
-            "indexed": count,
-            "tenant_id": tenant_id,
-            "message": "Sample documents indexed. Wait 10 seconds before querying."
-        }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.delete("/tenant/{tenant_id}")
-async def delete_tenant(tenant_id: str):
-    """Delete all data for a tenant"""
-    try:
-        rag_service = get_rag_service()
-        success = rag_service.delete_tenant_data(tenant_id)
-        return {
-            "success": success,
-            "tenant_id": tenant_id
-        }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+# Export assistant info for client apps
+@app.get("/assistant/info")
+async def assistant_info():
+    """Return assistant configuration for frontend integration"""
+    return {
+        "assistant_name": ASSISTANT_NAME,
+        "host": ASSISTANT_HOST,
+        "api_version": "v2",
+        "features": [
+            "Natural language processing",
+            "Document citations",
+            "Real-time tracking",
+            "Delivery estimates",
+            "Shipping guidance"
+        ]
+    }
 
 
 if __name__ == "__main__":
